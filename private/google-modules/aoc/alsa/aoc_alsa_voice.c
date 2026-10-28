@@ -153,7 +153,6 @@ static int snd_aoc_pcm_close(struct snd_soc_component *component,
 	struct aoc_alsa_stream *alsa_stream = runtime->private_data;
 	struct aoc_chip *chip = alsa_stream->chip;
 	int err;
-	bool mutex_locked = true;
 
 	pr_debug("%s: name %s substream %p", __func__, rtd->dai_link->name,
 		 substream);
@@ -161,8 +160,7 @@ static int snd_aoc_pcm_close(struct snd_soc_component *component,
 
 	if (mutex_lock_interruptible(&chip->audio_mutex)) {
 		pr_err("ERR: interrupted while waiting for lock\n");
-		mutex_locked = false;
-		/* b/480740542 don't return to cleanup the resource */
+		return -EINTR;
 	}
 
 	/* Stop phone call (Refactor needed) */
@@ -205,8 +203,7 @@ static int snd_aoc_pcm_close(struct snd_soc_component *component,
 
 	chip->opened &= ~(1 << alsa_stream->idx);
 
-	if (mutex_locked)
-		mutex_unlock(&chip->audio_mutex);
+	mutex_unlock(&chip->audio_mutex);
 
 	return 0;
 }

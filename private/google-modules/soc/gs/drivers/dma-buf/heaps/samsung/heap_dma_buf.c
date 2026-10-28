@@ -481,4 +481,3 @@ const struct dma_buf_ops samsung_dma_buf_ops = {
 	.release = samsung_heap_dma_buf_release,
 	.get_flags = samsung_heap_dma_buf_get_flags,
 };
-EXPORT_SYMBOL_GPL(samsung_dma_buf_ops);

@@ -2446,22 +2446,18 @@ long aoc_unlocked_ioctl_handle_ion_fd(unsigned int cmd, unsigned long arg)
 
 	struct ion_physical_heap *phys_heap;
 	phys_addr_t base;
+	long ret = -EINVAL;
 	struct aoc_prvdata *prvdata = platform_get_drvdata(aoc_platform_device);
 
 	BUILD_BUG_ON(sizeof(struct aoc_ion_handle) !=
 				_IOC_SIZE(AOC_IOCTL_ION_FD_TO_HANDLE));
 
 	if (copy_from_user(&handle, (struct aoc_ion_handle *)arg, _IOC_SIZE(cmd)))
-		return -EFAULT;
+		return ret;
 
 	dmabuf = dma_buf_get(handle.fd);
 	if (IS_ERR(dmabuf))
-		return PTR_ERR(dmabuf);
-
-	if (dmabuf->ops != &samsung_dma_buf_ops) {
-		dma_buf_put(dmabuf);
-		return -EINVAL;
-	}
+		 return -EINVAL;
 
 	dma_heap_buf = dmabuf->priv;
 	handle.handle = (u64)dma_heap_buf->priv;
@@ -2476,17 +2472,15 @@ long aoc_unlocked_ioctl_handle_ion_fd(unsigned int cmd, unsigned long arg)
 		base = phys_heap->base;
 	}
 
-	if (!(is_aoc_dma_buf(prvdata, base))) {
-		dma_buf_put(dmabuf);
-		return -EINVAL;
-	}
+	if (!(is_aoc_dma_buf(prvdata, base)))
+		return ret;
 
 	dma_buf_put(dmabuf);
 
-	if (copy_to_user((struct aoc_ion_handle *)arg, &handle, _IOC_SIZE(cmd)))
-		return -EFAULT;
+	if (!copy_to_user((struct aoc_ion_handle *)arg, &handle, _IOC_SIZE(cmd)))
+		ret = 0;
 
-	return 0;
+	return ret;
 }
 
 static int platform_probe_parse_dt(struct device *dev, struct device_node *aoc_node)

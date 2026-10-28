@@ -198,6 +198,9 @@ static char boot_mode_string[64];
 module_param_string(mode, boot_mode_string, sizeof(boot_mode_string), 0440);
 MODULE_PARM_DESC(mode, "Android bootmode");
 
+static bool modparam_disable_cc_toggling_by_default;
+module_param_named(disable_cc_toggling_by_default, modparam_disable_cc_toggling_by_default, bool, 0444);
+
 static u32 partner_src_caps[PDO_MAX_OBJECTS];
 static unsigned int nr_partner_src_caps;
 static bool port_src_pdo_updated;
@@ -347,18 +350,9 @@ static ssize_t cc_toggle_enable_show(struct device *dev, struct device_attribute
 	return scnprintf(buf, PAGE_SIZE, "%d\n", chip->toggle_disable_status ? 0 : 1);
 };
 
-static ssize_t cc_toggle_enable_store(struct device *dev, struct device_attribute *attr,
-				      const char *buf, size_t count)
+static int cc_toggle_enable_set(struct max77759_plat *chip, int val)
 {
-	struct max77759_plat *chip = i2c_get_clientdata(to_i2c_client(dev));
-	int val, ret;
-
-	__pm_stay_awake(chip->cc_toggle_ws);
-
-	if (kstrtoint(buf, 10, &val) < 0) {
-		__pm_relax(chip->cc_toggle_ws);
-		return -EINVAL;
-	}
+	int ret;
 
 	logbuffer_logk(chip->log, LOGLEVEL_INFO, "Requesting CC toggle, cc state: curr=%s next=%s",
 		       !chip->toggle_disable_status ? "on" : "off", val ? "on" : "off");
@@ -369,10 +363,73 @@ static ssize_t cc_toggle_enable_store(struct device *dev, struct device_attribut
 	if (ret < 0)
 		dev_err(chip->dev, "Cannot set TOGGLE DISABLE=%d (%d)\n", val, ret);
 
+	return ret;
+}
+
+static ssize_t cc_toggle_enable_store(struct device *dev, struct device_attribute *attr,
+				      const char *buf, size_t count)
+{
+	struct max77759_plat *chip = i2c_get_clientdata(to_i2c_client(dev));
+	int val;
+
+	__pm_stay_awake(chip->cc_toggle_ws);
+
+	if (kstrtoint(buf, 10, &val) < 0) {
+		__pm_relax(chip->cc_toggle_ws);
+		return -EINVAL;
+	}
+
+	cc_toggle_enable_set(chip, val);
+
 	__pm_relax(chip->cc_toggle_ws);
+
 	return count;
 }
 static DEVICE_ATTR_RW(cc_toggle_enable);
+
+static ssize_t data_path_enable_show(struct device *dev, struct device_attribute *attr,
+				     char *buf)
+{
+	struct max77759_plat *chip = i2c_get_clientdata(to_i2c_client(dev));
+
+	return scnprintf(buf, PAGE_SIZE, "%d\n", chip->data_path_enabled);
+};
+
+// There are three supported commands:
+// 0: disable data path immediately if it's currently enabled, prevent re-enabling data path; ignore alt modes on
+// subsequent connections
+// -1: prevent enabling data path on subsequent connections, but don't disable data path if it's currently enabled;
+// ignore alt modes on subsequent connections
+// 1: enable data path immediately if port is currently connected and data path is disabled, allow enabling data path on
+// subsequent connections; do not ignore alt modes on subsequent connections
+static ssize_t data_path_enable_store(struct device *dev, struct device_attribute *attr,
+				      const char *buf, size_t count)
+{
+	struct max77759_plat *chip;
+	int val;
+
+	if (kstrtoint(buf, 10, &val) < 0)
+		return -EINVAL;
+
+	chip = i2c_get_clientdata(to_i2c_client(dev));
+
+	mutex_lock(&chip->data_path_lock);
+	chip->data_path_enabled = val > 0 ? 1 : 0;
+
+#define DO_NOT_IGNORE_ALT_MODES (UINT_MAX - 1)
+#define IGNORE_ALT_MODES (UINT_MAX)
+	// tcpm_update_sink_capabilities is reused to avoid changing ABI
+	tcpm_update_sink_capabilities(chip->port, NULL, chip->data_path_enabled ? DO_NOT_IGNORE_ALT_MODES : IGNORE_ALT_MODES, 0);
+
+	if (val != -1) {
+		// function name is misleading, it disables data path too when necessary
+		enable_data_path_locked(chip);
+	}
+
+	mutex_unlock(&chip->data_path_lock);
+	return count;
+}
+static DEVICE_ATTR_RW(data_path_enable);
 
 static ssize_t non_compliant_reasons_show(struct device *dev, struct device_attribute *attr,
 					  char *buf)
@@ -698,6 +755,7 @@ static struct device_attribute *max77759_device_attrs[] = {
 	&dev_attr_contaminant_detection,
 	&dev_attr_contaminant_detection_status,
 	&dev_attr_cc_toggle_enable,
+	&dev_attr_data_path_enable,
 	&dev_attr_non_compliant_reasons,
 	&dev_attr_usb_limit_sink_enable,
 	&dev_attr_usb_limit_sink_current,
@@ -1130,6 +1188,11 @@ void enable_data_path_locked(struct max77759_plat *chip)
 	enable_data = ((chip->pd_data_capable || chip->no_bc_12 || chip->bc12_data_capable ||
 		       chip->debug_acc_connected) && !chip->bc12_running) ||
 		       chip->data_role == TYPEC_HOST;
+
+	if (!chip->data_path_enabled) {
+		LOG(LOG_LVL_DEBUG, chip->log, "%s: data_path_enabled is false, orig enable_data: %i", __func__, enable_data);
+		enable_data = false;
+	}
 
 	logbuffer_logk(chip->log, LOGLEVEL_INFO,
 		       "pd_data_capable:%u no_bc_12:%u bc12_data_capable:%u attached:%u debug_acc:%u bc12_running:%u data_active:%u",
@@ -3894,6 +3957,11 @@ static int max77759_probe(struct i2c_client *client,
 	if (!of_property_read_u32(dn, "ext-bst-ovp-clear-mv", &chip->ext_bst_ovp_clear_mv))
 		LOG(LOG_LVL_DEBUG, chip->log, "ext_bst_ovp_clear_mv set to %u",
 		    chip->ext_bst_ovp_clear_mv);
+
+	if (modparam_disable_cc_toggling_by_default)
+		cc_toggle_enable_set(chip, 0);
+
+	chip->data_path_enabled = true;
 
 	ret = max77759_init_alert(chip, client);
 	if (ret < 0)
